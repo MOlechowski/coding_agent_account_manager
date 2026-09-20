@@ -98,6 +98,19 @@ func (s *Server) loadOrGenerateToken() (string, error) {
 		return "", err
 	}
 
+	// Repair permissions before reading an existing bearer token. A token file
+	// created by an older version must not remain readable by other users.
+	if info, err := os.Stat(s.tokenPath); err == nil {
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("API token path is not a regular file: %s", s.tokenPath)
+		}
+		if info.Mode().Perm() != 0600 {
+			if err := os.Chmod(s.tokenPath, 0600); err != nil {
+				return "", fmt.Errorf("restrict API token permissions: %w", err)
+			}
+		}
+	}
+
 	// Try to read existing token
 	data, err := os.ReadFile(s.tokenPath)
 	if err == nil && len(data) > 0 {

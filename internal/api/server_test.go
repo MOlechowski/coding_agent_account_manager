@@ -74,6 +74,34 @@ func TestLoadOrGenerateToken(t *testing.T) {
 	}
 }
 
+func TestLoadOrGenerateTokenRepairsPermissions(t *testing.T) {
+	tmpDir := t.TempDir()
+	tokenPath := filepath.Join(tmpDir, "subdir", ".api_token")
+	if err := os.MkdirAll(filepath.Dir(tokenPath), 0700); err != nil {
+		t.Fatalf("mkdir token directory: %v", err)
+	}
+	if err := os.WriteFile(tokenPath, []byte("existing-token"), 0644); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+
+	s := &Server{tokenPath: tokenPath}
+	got, err := s.loadOrGenerateToken()
+	if err != nil {
+		t.Fatalf("loadOrGenerateToken() error = %v", err)
+	}
+	if got != "existing-token" {
+		t.Fatalf("token = %q, want existing token", got)
+	}
+
+	info, err := os.Stat(tokenPath)
+	if err != nil {
+		t.Fatalf("stat token: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Errorf("token permissions = %o, want 0600", info.Mode().Perm())
+	}
+}
+
 func TestLoadOrGenerateTokenIgnoresWhitespace(t *testing.T) {
 	tmpDir := t.TempDir()
 	tokenPath := filepath.Join(tmpDir, "subdir", ".api_token")
