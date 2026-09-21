@@ -101,6 +101,10 @@ func TestGetExtractor(t *testing.T) {
 		{"claude", false},
 		{"codex", false},
 		{"gemini", false},
+		{"agy", false},
+		{"grok", false},
+		{"opencode", false},
+		{"cursor", false},
 		{"unknown", true},
 		{"", true},
 	}
@@ -118,6 +122,43 @@ func TestGetExtractor(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestGenericFreshnessExtractorUsesPortableBackupTime(t *testing.T) {
+	backedUpAt := time.Date(2026, 9, 21, 16, 30, 20, 0, time.FixedZone("CEST", 2*60*60))
+	authFiles := map[string][]byte{
+		"/remote/vault/agy/main/meta.json":        []byte(`{"backed_up_at":"2026-09-21T16:30:20+02:00"}`),
+		"/remote/vault/agy/main/oauth_creds.json": []byte(`{"refresh_token":"opaque"}`),
+	}
+
+	freshness, err := (&GenericFreshnessExtractor{}).Extract("agy", "main", authFiles)
+	if err != nil {
+		t.Fatalf("extract generic freshness: %v", err)
+	}
+	if !freshness.ModifiedAt.Equal(backedUpAt) {
+		t.Errorf("ModifiedAt = %s, want %s", freshness.ModifiedAt, backedUpAt)
+	}
+}
+
+func TestGenericFreshnessExtractorFallsBackToLocalModificationTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(path, []byte(`{"token":"opaque"}`), 0600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	modifiedAt := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(path, modifiedAt, modifiedAt); err != nil {
+		t.Fatalf("set auth file time: %v", err)
+	}
+
+	freshness, err := (&GenericFreshnessExtractor{}).Extract("grok", "main", map[string][]byte{
+		path: []byte(`{"token":"opaque"}`),
+	})
+	if err != nil {
+		t.Fatalf("extract generic freshness: %v", err)
+	}
+	if !freshness.ModifiedAt.Equal(modifiedAt) {
+		t.Errorf("ModifiedAt = %s, want %s", freshness.ModifiedAt, modifiedAt)
 	}
 }
 
