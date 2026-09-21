@@ -322,7 +322,7 @@ func TestSyncedProvidersIsACopy(t *testing.T) {
 	if b[0] == "mutated" {
 		t.Error("SyncedProviders must return a defensive copy")
 	}
-	want := []string{"claude", "codex", "gemini", "opencode", "cursor"}
+	want := []string{"claude", "codex", "gemini", "agy", "grok", "opencode", "cursor"}
 	if len(b) != len(want) {
 		t.Fatalf("SyncedProviders = %v", b)
 	}

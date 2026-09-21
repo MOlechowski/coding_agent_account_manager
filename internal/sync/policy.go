@@ -84,7 +84,7 @@ var concurrencySafeProviders = map[string]bool{
 // syncedProviders is the fixed set of provider vault directories the sync
 // engine walks. Kept in one place so the walker and the policy status
 // display cannot drift apart.
-var syncedProviders = []string{"claude", "codex", "gemini", "opencode", "cursor"}
+var syncedProviders = []string{"claude", "codex", "gemini", "agy", "grok", "opencode", "cursor"}
 
 // SyncedProviders returns the providers whose vault directories participate
 // in multi-machine sync, in stable order.
