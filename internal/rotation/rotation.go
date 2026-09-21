@@ -35,6 +35,35 @@ const (
 	AlgorithmRandom Algorithm = "random"
 )
 
+// Policy identifies a rotation policy that shapes how candidates are ranked.
+//
+// The policy is orthogonal to the algorithm: the default availability policy
+// keeps the existing behavior of every algorithm unchanged, while the opt-in
+// drain policy replaces scoring with drain-before-reset ranking (issue #81).
+type Policy string
+
+const (
+	// PolicyAvailability is the default policy: maximize immediate headroom
+	// (the pre-existing behavior; scoring is unchanged).
+	PolicyAvailability Policy = "availability"
+
+	// PolicyDrain is an opt-in policy that prefers the profile whose included
+	// quota resets soonest, among profiles still under the drain headroom
+	// ceiling. This drains expiring quota before it is lost, instead of
+	// leaving it unused while a fresher account is consumed.
+	PolicyDrain Policy = "drain"
+)
+
+// DefaultDrainCeiling is the default headroom ceiling (percent used) for the
+// drain policy. Profiles at or above this usage are held in reserve rather
+// than drained further, so a task has room to finish.
+const DefaultDrainCeiling = 95
+
+// drainBaseScore is the score baseline for drain-eligible profiles. It is
+// large enough that any drain candidate outranks reserve profiles (whose
+// scores are availability-based, 0-100) for any realistic reset horizon.
+const drainBaseScore = 10000.0
+
 // Reason explains why a profile was or wasn't selected.
 type Reason struct {
 	Text     string // Human-readable explanation
@@ -53,36 +82,74 @@ type Result struct {
 	Selected     string         // The profile that was selected
 	Alternatives []ProfileScore // Other profiles with their scores, sorted by score desc
 	Algorithm    Algorithm      // Which algorithm was used
+	Explanation  string         // One-line explanation of the choice (drain policy only)
 }
 
 // UsageInfo represents real-time rate limit usage for a profile.
 type UsageInfo struct {
 	ProfileName      string
-	PrimaryPercent   int     // Primary window usage (0-100)
-	SecondaryPercent int     // Secondary window usage (0-100)
-	AvailScore       int     // Availability score (0-100, higher is better)
-	Error            string  // Error message if fetch failed
+	PrimaryPercent   int        // Primary window usage (0-100)
+	SecondaryPercent int        // Secondary window usage (0-100)
+	ScopedPercent    int        // Worst applicable model-scoped quota (0-100); 0 when none
+	ScopedLabel      string     // Model that quota is scoped to, e.g. "Fable"
+	AvailScore       int        // Availability score (0-100, higher is better)
+	ResetsAt         *time.Time // Earliest known quota reset time (nil if unknown)
+	Error            string     // Error message if fetch failed
+}
+
+// scopedQuotaLabel names the model a scoped quota belongs to, for providers
+// that report one without a display name.
+func scopedQuotaLabel(u *UsageInfo) string {
+	if u == nil || u.ScopedLabel == "" {
+		return "Model-scoped"
+	}
+	return u.ScopedLabel
 }
 
 // Selector performs profile selection based on configured algorithm.
 type Selector struct {
-	mu          sync.RWMutex
-	algorithm   Algorithm
-	healthStore *health.Storage
-	db          *caamdb.DB
-	rng         *rand.Rand
-	avoidRecent time.Duration // Don't select profiles used within this duration
-	usageData   map[string]*UsageInfo // Real-time usage data by profile name
+	mu           sync.RWMutex
+	algorithm    Algorithm
+	healthStore  *health.Storage
+	db           *caamdb.DB
+	rng          *rand.Rand
+	avoidRecent  time.Duration         // Don't select profiles used within this duration
+	usageData    map[string]*UsageInfo // Real-time usage data by profile name
+	policy       Policy                // Selection policy (default: availability)
+	drainCeiling int                   // Headroom ceiling (percent used) for the drain policy
 }
 
 // NewSelector creates a new profile selector.
 func NewSelector(algorithm Algorithm, healthStore *health.Storage, db *caamdb.DB) *Selector {
 	return &Selector{
-		algorithm:   algorithm,
-		healthStore: healthStore,
-		db:          db,
-		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
-		avoidRecent: 30 * time.Minute, // Default: avoid profiles used in last 30 min
+		algorithm:    algorithm,
+		healthStore:  healthStore,
+		db:           db,
+		rng:          rand.New(rand.NewSource(time.Now().UnixNano())),
+		avoidRecent:  30 * time.Minute, // Default: avoid profiles used in last 30 min
+		policy:       PolicyAvailability,
+		drainCeiling: DefaultDrainCeiling,
+	}
+}
+
+// SetPolicy sets the selection policy. An empty or unknown policy leaves the
+// default (availability) in place.
+func (s *Selector) SetPolicy(p Policy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch p {
+	case PolicyAvailability, PolicyDrain:
+		s.policy = p
+	}
+}
+
+// SetDrainCeiling sets the headroom ceiling (percent used, 1-100) for the
+// drain policy. Values outside that range are ignored.
+func (s *Selector) SetDrainCeiling(percent int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if percent >= 1 && percent <= 100 {
+		s.drainCeiling = percent
 	}
 }
 
@@ -142,6 +209,12 @@ func (s *Selector) Select(tool string, profiles []string, currentProfile string)
 		}, nil
 	}
 
+	// Opt-in drain policy overrides algorithm scoring (issue #81):
+	// drain quota that resets soonest before it expires unused.
+	if s.policy == PolicyDrain {
+		return s.selectDrain(tool, available)
+	}
+
 	switch s.algorithm {
 	case AlgorithmRandom:
 		return s.selectRandom(tool, available)
@@ -150,6 +223,140 @@ func (s *Selector) Select(tool string, profiles []string, currentProfile string)
 	default:
 		return s.selectSmart(tool, available)
 	}
+}
+
+// selectDrain implements the opt-in drain-before-reset policy (issue #81).
+//
+// Among profiles that are not in cooldown, have usable quota below the
+// configured headroom ceiling, and have a known future reset time, it prefers
+// the profile whose quota resets SOONEST — draining included quota that would
+// otherwise expire unused. Profiles at/above the ceiling, with unknown reset
+// times, or with failed usage fetches are held in reserve, ranked by
+// availability so the fallback order stays sensible.
+func (s *Selector) selectDrain(tool string, profiles []string) (*Result, error) {
+	now := time.Now()
+	var scores []ProfileScore
+	drainEligible := make(map[string]bool)
+	usedPercents := make(map[string]int)
+	resetIn := make(map[string]time.Duration)
+
+	for _, p := range profiles {
+		score := ProfileScore{Name: p}
+
+		// Cooldown is disqualifying, same as the other selectors.
+		if s.isInCooldown(tool, p, now) {
+			remaining := s.cooldownRemaining(tool, p, now)
+			score.Score = -10000
+			score.Reasons = append(score.Reasons, Reason{
+				Text:     fmt.Sprintf("In cooldown (%s remaining)", formatDuration(remaining)),
+				Positive: false,
+			})
+			scores = append(scores, score)
+			continue
+		}
+
+		var usage *UsageInfo
+		if s.usageData != nil {
+			usage = s.usageData[p]
+		}
+
+		switch {
+		case usage != nil && usage.Error == "":
+			// The most constrained window governs headroom — including a
+			// model-scoped quota, which can be spent while the general
+			// windows still read as idle (issue #97).
+			used := usage.PrimaryPercent
+			if usage.SecondaryPercent > used {
+				used = usage.SecondaryPercent
+			}
+			if usage.ScopedPercent > used {
+				used = usage.ScopedPercent
+			}
+			usedPercents[p] = used
+
+			switch {
+			case used >= s.drainCeiling:
+				// Too close to the limit to drain safely; keep as reserve.
+				score.Score = float64(usage.AvailScore)
+				score.Reasons = append(score.Reasons, Reason{
+					Text:     fmt.Sprintf("Above drain ceiling (%d%% used >= %d%%); held in reserve", used, s.drainCeiling),
+					Positive: false,
+				})
+			case usage.ResetsAt != nil && usage.ResetsAt.After(now):
+				// Drain candidate: sooner reset = higher score.
+				until := usage.ResetsAt.Sub(now)
+				drainEligible[p] = true
+				resetIn[p] = until
+				score.Score = drainBaseScore - until.Hours()
+				score.Reasons = append(score.Reasons, Reason{
+					Text:     fmt.Sprintf("Drain candidate: resets in %s, %d%% used", formatDuration(until), used),
+					Positive: true,
+				})
+			default:
+				// Usable quota but no (future) reset time; rank by availability.
+				score.Score = float64(usage.AvailScore)
+				score.Reasons = append(score.Reasons, Reason{
+					Text:     "No quota reset time available; held in reserve",
+					Positive: false,
+				})
+			}
+		case usage != nil && usage.Error != "":
+			score.Score = -10
+			score.Reasons = append(score.Reasons, Reason{
+				Text:     "Usage data unavailable; held in reserve",
+				Positive: false,
+			})
+		default:
+			score.Score = 0
+			score.Reasons = append(score.Reasons, Reason{
+				Text:     "No usage data; held in reserve",
+				Positive: false,
+			})
+		}
+
+		scores = append(scores, score)
+	}
+
+	// Sort by score descending; break ties by name for determinism.
+	sort.Slice(scores, func(i, j int) bool {
+		if scores[i].Score != scores[j].Score {
+			return scores[i].Score > scores[j].Score
+		}
+		return scores[i].Name < scores[j].Name
+	})
+
+	if len(scores) == 0 {
+		return nil, fmt.Errorf("no profiles available for %s", tool)
+	}
+	if scores[0].Score < -9000 {
+		return nil, fmt.Errorf("all profiles for %s are in cooldown", tool)
+	}
+
+	selected := scores[0]
+
+	// Explanation string requested by issue #81, e.g.:
+	// "chose work: resets in 42m, 91% used; fallback personal held in reserve"
+	var explanation string
+	if drainEligible[selected.Name] {
+		explanation = fmt.Sprintf("chose %s: resets in %s, %d%% used",
+			selected.Name, formatDuration(resetIn[selected.Name]), usedPercents[selected.Name])
+	} else {
+		explanation = fmt.Sprintf("chose %s: no drain-eligible profile (need usable quota under %d%% with a known reset); ranked by availability",
+			selected.Name, s.drainCeiling)
+	}
+	for _, ps := range scores[1:] {
+		if ps.Score > -9000 {
+			explanation += fmt.Sprintf("; fallback %s held in reserve", ps.Name)
+			break
+		}
+	}
+
+	return &Result{
+		Selected:     selected.Name,
+		Algorithm:    s.algorithm,
+		Alternatives: scores,
+		Explanation:  explanation,
+	}, nil
 }
 
 // selectRandom picks a profile at random.
@@ -334,23 +541,10 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 				}
 
 				// Plan type bonus
-				switch h.PlanType {
-				case "enterprise":
-					score.Score += 30
+				if bonus := planBonus(h.PlanType); bonus > 0 {
+					score.Score += bonus
 					score.Reasons = append(score.Reasons, Reason{
-						Text:     "Enterprise plan",
-						Positive: true,
-					})
-				case "pro":
-					score.Score += 20
-					score.Reasons = append(score.Reasons, Reason{
-						Text:     "Pro plan",
-						Positive: true,
-					})
-				case "team":
-					score.Score += 20
-					score.Reasons = append(score.Reasons, Reason{
-						Text:     "Team plan",
+						Text:     health.FormatPlanType(h.PlanType) + " plan",
 						Positive: true,
 					})
 				}
@@ -424,6 +618,17 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 						Positive: false,
 					})
 				}
+
+				// A spent model-scoped quota makes the profile unusable for
+				// that model even when its general windows are idle, so say so
+				// and rank it down (issue #97).
+				if usage.ScopedPercent >= 80 {
+					score.Score -= 30
+					score.Reasons = append(score.Reasons, Reason{
+						Text:     fmt.Sprintf("%s limit %d%% used (near limit)", scopedQuotaLabel(usage), usage.ScopedPercent),
+						Positive: false,
+					})
+				}
 			} else if usage != nil && usage.Error != "" {
 				// Fetching failed - slight penalty but don't disqualify
 				score.Score -= 10
@@ -460,6 +665,22 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 		Algorithm:    AlgorithmSmart,
 		Alternatives: scores,
 	}, nil
+}
+
+// planBonus converts a subscription plan into rotation score points. The
+// ranking lives in health.PlanTierOf so this scorer and the health scorer
+// cannot drift apart; only the point values are local.
+func planBonus(planType string) float64 {
+	switch health.PlanTierOf(planType) {
+	case health.PlanTierEnterprise:
+		return 30
+	case health.PlanTierHighVolume:
+		return 25
+	case health.PlanTierStandard:
+		return 20
+	default:
+		return 0
+	}
 }
 
 // isInCooldown checks if a profile is currently in cooldown.
@@ -544,6 +765,9 @@ func FormatResult(r *Result) string {
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Recommended: %s\n", r.Selected))
+	if r.Explanation != "" {
+		sb.WriteString(fmt.Sprintf("  %s\n", r.Explanation))
+	}
 
 	// Find the selected profile's reasons
 	for _, ps := range r.Alternatives {

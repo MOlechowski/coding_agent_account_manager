@@ -1,8 +1,12 @@
 package health
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -837,6 +841,304 @@ func TestParseExpiryField_AdditionalFormats(t *testing.T) {
 		result := parseExpiryField(struct{}{})
 		if !result.IsZero() {
 			t.Error("unknown type should return zero time")
+		}
+	})
+}
+
+// TestParseClaudeExpiry_SelfRefreshing: a Claude credential with a refresh
+// token is renewed by Claude Code itself; one without is not (PR #84).
+func TestParseClaudeExpiry_SelfRefreshing(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	exp := time.Now().Add(4 * time.Hour).UnixMilli()
+
+	dir := write(t, `{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":`+itoa(exp)+`}}`)
+	info, err := ParseClaudeExpiry(dir)
+	if err != nil {
+		t.Fatalf("ParseClaudeExpiry() error = %v", err)
+	}
+	if !info.SelfRefreshing || !info.HasRefreshToken {
+		t.Errorf("with refresh token: SelfRefreshing=%v HasRefreshToken=%v, want both true", info.SelfRefreshing, info.HasRefreshToken)
+	}
+
+	dir = write(t, `{"claudeAiOauth":{"accessToken":"a","expiresAt":`+itoa(exp)+`}}`)
+	info, err = ParseClaudeExpiry(dir)
+	if err != nil {
+		t.Fatalf("ParseClaudeExpiry() error = %v", err)
+	}
+	if info.SelfRefreshing {
+		t.Error("without refresh token: SelfRefreshing = true, want false")
+	}
+
+	// Other providers never set the flag.
+	codexPath := writeCodexAuthJSON(t, map[string]any{"access_token": "a", "refresh_token": "r", "expires_at": exp / 1000})
+	cinfo, err := ParseCodexExpiry(codexPath)
+	if err != nil {
+		t.Fatalf("ParseCodexExpiry() error = %v", err)
+	}
+	if cinfo.SelfRefreshing {
+		t.Error("codex: SelfRefreshing = true, want false")
+	}
+}
+
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// unsignedJWT builds a three-part JWT with the given payload claims. The
+// parsers never validate signatures, so a placeholder signature suffices.
+func unsignedJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	return header + "." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+}
+
+// writeCodexAuthJSON writes a Codex auth.json into a temp dir and returns its path.
+func writeCodexAuthJSON(t *testing.T, content map[string]any) string {
+	t.Helper()
+	data, err := json.Marshal(content)
+	if err != nil {
+		t.Fatalf("marshal auth.json: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
+	return path
+}
+
+// TestParseCodexExpiry_ChatGPTMode covers the auth.json layout Codex writes
+// for ChatGPT-mode logins: JWTs nested under "tokens", no expiry field. The
+// id_token is short-lived and only carries identity claims, so health must
+// follow the access token's exp instead (PR #86).
+func TestParseCodexExpiry_ChatGPTMode(t *testing.T) {
+	accessExp := time.Now().Add(9 * 24 * time.Hour).Truncate(time.Second)
+	idExp := time.Now().Add(-5 * 24 * time.Hour).Truncate(time.Second)
+
+	t.Run("access token expiry wins over expired id token", func(t *testing.T) {
+		path := writeCodexAuthJSON(t, map[string]any{
+			"auth_mode": "chatgpt",
+			"tokens": map[string]any{
+				"id_token":      unsignedJWT(t, map[string]any{"email": "codex@example.com", "exp": idExp.Unix()}),
+				"access_token":  unsignedJWT(t, map[string]any{"exp": accessExp.Unix()}),
+				"refresh_token": "rt-example",
+			},
+			"last_refresh": time.Now().Add(-4 * 24 * time.Hour).Format(time.RFC3339),
+		})
+
+		info, err := ParseCodexExpiry(path)
+		if err != nil {
+			t.Fatalf("ParseCodexExpiry() error = %v", err)
+		}
+		if !info.ExpiresAt.Equal(accessExp) {
+			t.Errorf("ExpiresAt = %v, want access token exp %v", info.ExpiresAt, accessExp)
+		}
+		if !info.HasRefreshToken {
+			t.Error("HasRefreshToken = false, want true for tokens.refresh_token")
+		}
+		if info.IsExpired() {
+			t.Error("IsExpired() = true, want false while the access token is valid")
+		}
+		if info.Source != path {
+			t.Errorf("Source = %q, want %q", info.Source, path)
+		}
+	})
+
+	t.Run("access token wins even when id token expires later", func(t *testing.T) {
+		laterID := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
+		path := writeCodexAuthJSON(t, map[string]any{
+			"tokens": map[string]any{
+				"id_token":     unsignedJWT(t, map[string]any{"exp": laterID.Unix()}),
+				"access_token": unsignedJWT(t, map[string]any{"exp": accessExp.Unix()}),
+			},
+		})
+
+		info, err := ParseCodexExpiry(path)
+		if err != nil {
+			t.Fatalf("ParseCodexExpiry() error = %v", err)
+		}
+		if !info.ExpiresAt.Equal(accessExp) {
+			t.Errorf("ExpiresAt = %v, want access token exp %v", info.ExpiresAt, accessExp)
+		}
+		if info.HasRefreshToken {
+			t.Error("HasRefreshToken = true, want false without a refresh token")
+		}
+	})
+
+	t.Run("falls back to id token when access token is not a JWT", func(t *testing.T) {
+		path := writeCodexAuthJSON(t, map[string]any{
+			"tokens": map[string]any{
+				"id_token":     unsignedJWT(t, map[string]any{"exp": accessExp.Unix()}),
+				"access_token": "opaque-not-a-jwt",
+			},
+		})
+
+		info, err := ParseCodexExpiry(path)
+		if err != nil {
+			t.Fatalf("ParseCodexExpiry() error = %v", err)
+		}
+		if !info.ExpiresAt.Equal(accessExp) {
+			t.Errorf("ExpiresAt = %v, want id token exp %v", info.ExpiresAt, accessExp)
+		}
+	})
+
+	t.Run("refresh token alone is still useful", func(t *testing.T) {
+		path := writeCodexAuthJSON(t, map[string]any{
+			"tokens": map[string]any{
+				"id_token":      "garbage",
+				"access_token":  "garbage",
+				"refresh_token": "rt-example",
+			},
+		})
+
+		info, err := ParseCodexExpiry(path)
+		if err != nil {
+			t.Fatalf("ParseCodexExpiry() error = %v", err)
+		}
+		if !info.ExpiresAt.IsZero() {
+			t.Errorf("ExpiresAt = %v, want zero when no JWT parses", info.ExpiresAt)
+		}
+		if !info.HasRefreshToken {
+			t.Error("HasRefreshToken = false, want true")
+		}
+	})
+
+	t.Run("nothing usable is ErrNoExpiry", func(t *testing.T) {
+		path := writeCodexAuthJSON(t, map[string]any{
+			"tokens": map[string]any{"id_token": "garbage", "access_token": "garbage"},
+		})
+
+		if _, err := ParseCodexExpiry(path); !errors.Is(err, ErrNoExpiry) {
+			t.Errorf("ParseCodexExpiry() error = %v, want ErrNoExpiry", err)
+		}
+	})
+
+	t.Run("explicit expires_at outranks the JWTs", func(t *testing.T) {
+		explicit := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+		path := writeCodexAuthJSON(t, map[string]any{
+			"expires_at":    explicit.Unix(),
+			"refresh_token": "rt-flat",
+			"tokens": map[string]any{
+				"access_token": unsignedJWT(t, map[string]any{"exp": accessExp.Unix()}),
+			},
+		})
+
+		info, err := ParseCodexExpiry(path)
+		if err != nil {
+			t.Fatalf("ParseCodexExpiry() error = %v", err)
+		}
+		if !info.ExpiresAt.Equal(explicit) {
+			t.Errorf("ExpiresAt = %v, want explicit expires_at %v", info.ExpiresAt, explicit)
+		}
+		if !info.HasRefreshToken {
+			t.Error("HasRefreshToken = false, want true for a flat refresh_token")
+		}
+	})
+
+	t.Run("malformed JSON is an error", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "auth.json")
+		if err := os.WriteFile(path, []byte("{not json"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ParseCodexExpiry(path); err == nil || errors.Is(err, ErrNoExpiry) {
+			t.Errorf("ParseCodexExpiry() error = %v, want a parse error", err)
+		}
+	})
+}
+
+// TestParseGrokExpiry covers issue #101: Grok's auth.json is keyed by a
+// dynamic "<issuer>::<client-id>" key that the Codex parser cannot read, so
+// every live Grok profile reported unknown expiry and stuck at warning.
+// Tokens here are synthetic.
+func TestParseGrokExpiry(t *testing.T) {
+	writeGrok := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "auth.json")
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("dynamic credential key", func(t *testing.T) {
+		path := writeGrok(t, `{"https://auth.x.ai::00000000-0000-0000-0000-000000000000":`+
+			`{"key":"SYNTHETIC-GROK-TOKEN","auth_mode":"sso","email":"grok@example.com",`+
+			`"refresh_token":"SYNTHETIC-REFRESH","expires_at":"2099-01-01T00:00:00Z"}}`)
+		info, err := ParseGrokExpiry(path)
+		if err != nil {
+			t.Fatalf("ParseGrokExpiry() error = %v", err)
+		}
+		want := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+		if !info.ExpiresAt.Equal(want) {
+			t.Errorf("ExpiresAt = %v, want %v", info.ExpiresAt, want)
+		}
+		if !info.HasRefreshToken {
+			t.Error("HasRefreshToken = false, want true")
+		}
+		// The reported symptom: with no parseable expiry the profile scored
+		// "unknown", which lands on warning even with zero errors.
+		if got := CalculateStatus(&ProfileHealth{TokenExpiresAt: info.ExpiresAt}); got != StatusHealthy {
+			t.Errorf("CalculateStatus() = %v, want StatusHealthy for a live Grok profile", got)
+		}
+		if got := CalculateStatus(&ProfileHealth{}); got != StatusWarning {
+			t.Errorf("unparsed baseline = %v, want StatusWarning (the pre-fix behaviour)", got)
+		}
+	})
+
+	t.Run("the latest expiry across entries wins", func(t *testing.T) {
+		path := writeGrok(t, `{`+
+			`"https://auth.x.ai::aaaa":{"key":"A","expires_at":"2030-01-01T00:00:00Z"},`+
+			`"https://auth.x.ai::bbbb":{"key":"B","expires_at":"2040-01-01T00:00:00Z"}}`)
+		info, err := ParseGrokExpiry(path)
+		if err != nil {
+			t.Fatalf("ParseGrokExpiry() error = %v", err)
+		}
+		want := time.Date(2040, 1, 1, 0, 0, 0, 0, time.UTC)
+		if !info.ExpiresAt.Equal(want) {
+			t.Errorf("ExpiresAt = %v, want the later entry %v", info.ExpiresAt, want)
+		}
+	})
+
+	t.Run("flat layout still parses", func(t *testing.T) {
+		path := writeGrok(t, `{"access_token":"A","refresh_token":"R","expires_at":"2099-01-01T00:00:00Z"}`)
+		info, err := ParseGrokExpiry(path)
+		if err != nil {
+			t.Fatalf("ParseGrokExpiry() error = %v", err)
+		}
+		if !info.HasRefreshToken {
+			t.Error("HasRefreshToken = false, want true for a flat refresh_token")
+		}
+		want := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+		if !info.ExpiresAt.Equal(want) {
+			t.Errorf("ExpiresAt = %v, want %v", info.ExpiresAt, want)
+		}
+	})
+
+	t.Run("missing file reports ErrNoAuthFile", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "auth.json")
+		if _, err := ParseGrokExpiry(path); !errors.Is(err, ErrNoAuthFile) {
+			t.Errorf("ParseGrokExpiry() error = %v, want ErrNoAuthFile", err)
+		}
+	})
+
+	t.Run("no usable entry reports ErrNoExpiry", func(t *testing.T) {
+		path := writeGrok(t, `{"https://auth.x.ai::aaaa":{"email":"grok@example.com"}}`)
+		if _, err := ParseGrokExpiry(path); !errors.Is(err, ErrNoExpiry) {
+			t.Errorf("ParseGrokExpiry() error = %v, want ErrNoExpiry", err)
+		}
+	})
+
+	t.Run("malformed JSON is an error", func(t *testing.T) {
+		path := writeGrok(t, "{not json")
+		if _, err := ParseGrokExpiry(path); err == nil || errors.Is(err, ErrNoExpiry) {
+			t.Errorf("ParseGrokExpiry() error = %v, want a parse error", err)
 		}
 	})
 }

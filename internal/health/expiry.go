@@ -11,9 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 )
 
 // ErrNoExpiry indicates that expiry information could not be determined.
@@ -29,6 +33,39 @@ type ExpiryInfo struct {
 
 	// HasRefreshToken indicates if a refresh token is available.
 	HasRefreshToken bool
+
+	// SelfRefreshing reports that the provider's own CLI renews this access
+	// token in place from the refresh token stored beside it, and that caam
+	// neither can nor should refresh it. Claude Code works this way (see
+	// refresh.ClaudeRefreshDisabled): its access tokens live only a few
+	// hours and are renewed on next use, so a short TTL is routine lifecycle
+	// rather than a fault to warn about (PR #84).
+	//
+	// It answers only "must caam stay out of the way?", which is why it is
+	// set for Claude alone. Whether a lapsed token needs a human is the
+	// separate Renewable question below.
+	SelfRefreshing bool
+
+	// Renewable reports that an expired or expiring access token here can be
+	// renewed WITHOUT a human re-authenticating: a refresh token is stored
+	// beside it, or the provider's CLI renews the credential in place.
+	//
+	// This is deliberately distinct from SelfRefreshing (issue #102). The two
+	// answer different questions and Codex answers them differently:
+	//
+	//   - "Does this credential need a refresh soon?" — SelfRefreshing says
+	//     caam must not act (Claude only). For Codex the answer is yes: caam
+	//     has a Codex refresher and a pool refresher that both run off the
+	//     expiry signal, so the warning must survive.
+	//   - "Is this account unusable until someone logs in again?" — Renewable
+	//     says no. A Codex profile whose access token lapsed but whose refresh
+	//     token is present is live; the CLI renews it on next use. Reporting
+	//     it as expired made healthy profiles look dead in `caam ls` and had
+	//     controllers route around working accounts.
+	//
+	// Every provider sets it from HasRefreshToken; a self-refreshing
+	// credential is renewable by construction.
+	Renewable bool
 
 	// Source describes where the expiry was parsed from.
 	Source string
@@ -52,6 +89,21 @@ type ExpiryInfo struct {
 //	  }
 //	}
 func ParseClaudeExpiry(authDir string) (*ExpiryInfo, error) {
+	info, err := parseClaudeExpiryFiles(authDir)
+	if err != nil {
+		return nil, err
+	}
+	// Claude Code renews its own access token from the refresh token, and
+	// caam's Claude refresh is disabled, so a credential that carries a
+	// refresh token is self-refreshing — and therefore also renewable.
+	info.SelfRefreshing = info.HasRefreshToken
+	info.Renewable = info.HasRefreshToken
+	return info, nil
+}
+
+// parseClaudeExpiryFiles locates and parses the Claude credential file for
+// authDir ("" means the live locations under HOME / CLAUDE_CONFIG_DIR).
+func parseClaudeExpiryFiles(authDir string) (*ExpiryInfo, error) {
 	homeDir, _ := os.UserHomeDir()
 
 	if authDir == "" {
@@ -79,8 +131,11 @@ func ParseClaudeExpiry(authDir string) (*ExpiryInfo, error) {
 			}
 		}
 
-		// System state probing - check the actual credentials file location
+		// System state probing - check the actual credentials file location.
+		// On macOS the live token is in the login keychain and this file is
+		// its mirror, so refresh it first or expiry reads as unknown (#98).
 		credentialsPath := filepath.Join(homeDir, ".claude", ".credentials.json")
+		_, _ = keychain.EnsureMirror(credentialsPath)
 		info, err = parseClaudeCredentialsFile(credentialsPath)
 		if err == nil {
 			info.Source = credentialsPath
@@ -214,7 +269,7 @@ func parseClaudeCredentialsFile(path string) (*ExpiryInfo, error) {
 //
 // Codex stores auth in $CODEX_HOME/auth.json (default ~/.codex/auth.json).
 //
-// Expected JSON structure:
+// Two layouts exist. The flat OAuth layout carries an explicit expiry:
 //
 //	{
 //	  "access_token": "...",
@@ -222,6 +277,21 @@ func parseClaudeCredentialsFile(path string) (*ExpiryInfo, error) {
 //	  "expires_at": 1734451200,  // Unix timestamp (seconds)
 //	  "token_type": "Bearer"
 //	}
+//
+// ChatGPT-mode logins (the common case for Codex subscriptions) nest JWTs
+// under "tokens" and record no expiry field at all; the lifetimes live in
+// the JWT "exp" claims:
+//
+//	{
+//	  "auth_mode": "chatgpt",
+//	  "tokens": {"id_token": "<jwt>", "access_token": "<jwt>", "refresh_token": "..."},
+//	  "last_refresh": "2026-08-28T03:25:03Z"
+//	}
+//
+// For that layout the expiry is the access token's: it is what Codex sends
+// with API requests and refreshes from the refresh token. The id_token only
+// carries identity claims and routinely sits expired for days during a
+// working session, so its exp must not drive health.
 func ParseCodexExpiry(authPath string) (*ExpiryInfo, error) {
 	if authPath == "" {
 		codexHome := os.Getenv("CODEX_HOME")
@@ -232,7 +302,7 @@ func ParseCodexExpiry(authPath string) (*ExpiryInfo, error) {
 		authPath = filepath.Join(codexHome, "auth.json")
 	}
 
-	info, err := parseOAuthFile(authPath)
+	data, err := os.ReadFile(authPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrNoAuthFile
@@ -240,8 +310,188 @@ func ParseCodexExpiry(authPath string) (*ExpiryInfo, error) {
 		return nil, err
 	}
 
+	info, err := parseCodexAuthJSON(data)
+	if err != nil {
+		return nil, err
+	}
+
+	// SelfRefreshing stays unset: caam DOES refresh Codex (internal/refresh
+	// /codex.go plus the pool refresher), so the expiry signal those
+	// subsystems run on must keep flowing. Renewable is what tells `caam ls`
+	// and rotation that a lapsed access token here does not mean the account
+	// needs a human (issue #102).
+	info.Renewable = info.HasRefreshToken
+
 	info.Source = authPath
 	return info, nil
+}
+
+// codexTokensJSON is the nested "tokens" block of a ChatGPT-mode Codex
+// auth.json. Every field is a JWT except refresh_token.
+type codexTokensJSON struct {
+	IDToken      string `json:"id_token"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+// codexAuthJSON is the subset of a Codex auth.json needed to locate JWTs in
+// either layout (nested under "tokens", or flat at the top level).
+type codexAuthJSON struct {
+	IDToken     string          `json:"id_token"`
+	AccessToken string          `json:"access_token"`
+	Tokens      codexTokensJSON `json:"tokens"`
+}
+
+// parseCodexAuthJSON extracts expiry info from the contents of a Codex
+// auth.json in either layout. An explicit expiry field (flat layout, and
+// Grok's auth.json which reuses this parser) always wins; otherwise the
+// expiry is the access token's exp claim, falling back to the id_token only
+// when no access token parses.
+func parseCodexAuthJSON(data []byte) (*ExpiryInfo, error) {
+	info, err := parseOAuthJSON(data)
+	if err != nil {
+		if !errors.Is(err, ErrNoExpiry) {
+			return nil, err
+		}
+		// Flat fields yielded nothing usable; the JWTs below may still.
+		info = &ExpiryInfo{}
+	}
+
+	var auth codexAuthJSON
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+
+	if auth.Tokens.RefreshToken != "" {
+		info.HasRefreshToken = true
+	}
+
+	if info.ExpiresAt.IsZero() {
+		// Access token first (both layouts), then the identity token.
+		for _, token := range []string{auth.Tokens.AccessToken, auth.AccessToken, auth.Tokens.IDToken, auth.IDToken} {
+			if exp := jwtExpiry(token); !exp.IsZero() {
+				info.ExpiresAt = exp
+				break
+			}
+		}
+	}
+
+	if info.ExpiresAt.IsZero() && !info.HasRefreshToken {
+		return nil, ErrNoExpiry
+	}
+
+	return info, nil
+}
+
+// jwtExpiry returns the exp claim of a JWT without validating it, or the
+// zero time when the token is empty, malformed, or carries no exp.
+func jwtExpiry(token string) time.Time {
+	if token == "" {
+		return time.Time{}
+	}
+	id, err := identity.ExtractFromJWT(token)
+	if err != nil {
+		return time.Time{}
+	}
+	return id.ExpiresAt
+}
+
+// ParseGrokExpiry extracts token expiry from Grok Build's auth.json.
+//
+// Grok does not use either Codex layout. Its file is a JSON object keyed by a
+// dynamic credential key of the form "<oidc-issuer>::<client-id>", and the
+// entry object holds the token material:
+//
+//	{
+//	  "https://auth.x.ai::<uuid>": {
+//	    "key": "<access token>",
+//	    "auth_mode": "sso",
+//	    "refresh_token": "...",
+//	    "expires_at": "2026-12-31T00:00:00Z"
+//	  }
+//	}
+//
+// Reusing ParseCodexExpiry on this shape found neither an expiry nor a refresh
+// token, so a live, working Grok profile scored as "unknown expiry" and every
+// such profile was reported as a warning forever (issue #101). Top-level keys
+// are treated as opaque and scanned, mirroring identity.ExtractFromGrokAuth;
+// a flat layout is accepted first so this keeps working if a future CLI
+// version flattens the file.
+//
+// The entry with the latest expiry wins, so a file carrying several credential
+// entries reports the one that actually keeps the CLI working.
+//
+// SelfRefreshing is deliberately left unset, matching Codex: caam is free to
+// refresh Grok, so the expiry signal must keep reaching the refresh paths.
+// Renewable is set from the entry's refresh token, which is what keeps a
+// live Grok profile out of the "needs re-login" bucket (issue #102).
+func ParseGrokExpiry(authPath string) (*ExpiryInfo, error) {
+	if authPath == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		authPath = filepath.Join(homeDir, ".grok", "auth.json")
+	}
+
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrNoAuthFile
+		}
+		return nil, err
+	}
+
+	info, err := parseGrokAuthJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	info.Renewable = info.HasRefreshToken
+	info.Source = authPath
+	return info, nil
+}
+
+// parseGrokAuthJSON extracts expiry info from the contents of a Grok
+// auth.json in either the flat or the dynamic-key layout.
+func parseGrokAuthJSON(data []byte) (*ExpiryInfo, error) {
+	// Flat layout: OAuth fields directly at the top level.
+	if info, err := parseOAuthJSON(data); err == nil {
+		return info, nil
+	}
+
+	var entries map[string]json.RawMessage
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+
+	// Keys are scanned in sorted order so a tie between two entries with the
+	// same expiry resolves deterministically.
+	keys := make([]string, 0, len(entries))
+	for key := range entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var best *ExpiryInfo
+	for _, key := range keys {
+		entry, err := parseOAuthJSON(entries[key])
+		if err != nil {
+			continue
+		}
+		if best == nil {
+			best = entry
+			continue
+		}
+		// Prefer the entry that is usable for longest: a later expiry, or a
+		// known expiry over an unknown one.
+		if best.ExpiresAt.IsZero() || entry.ExpiresAt.After(best.ExpiresAt) {
+			best = entry
+		}
+	}
+	if best == nil {
+		return nil, ErrNoExpiry
+	}
+	return best, nil
 }
 
 // ParseGeminiExpiry extracts token expiry from Gemini CLI auth files.
@@ -252,6 +502,11 @@ func ParseCodexExpiry(authPath string) (*ExpiryInfo, error) {
 //
 // Note: Google OAuth tokens via ADC may not include expiry in the file itself.
 // The expiry is typically short-lived and requires refresh.
+//
+// SelfRefreshing stays unset (caam may refresh Gemini); Renewable follows the
+// stored refresh token, so an ADC credential — which carries a refresh token
+// and no expiry at all — is never mistaken for one that needs a re-login
+// (issue #102).
 func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 	checkSystem := false
 	if authDir == "" {
@@ -268,6 +523,7 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 	settingsPath := filepath.Join(authDir, "settings.json")
 	info, err := parseOAuthFile(settingsPath)
 	if err == nil {
+		info.Renewable = info.HasRefreshToken
 		info.Source = settingsPath
 		return info, nil
 	}
@@ -276,6 +532,7 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 	oauthPath := filepath.Join(authDir, "oauth_creds.json")
 	info, err = parseOAuthFile(oauthPath)
 	if err == nil {
+		info.Renewable = info.HasRefreshToken
 		info.Source = oauthPath
 		return info, nil
 	}
@@ -286,6 +543,7 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 		adcPath = getADCPath()
 		info, err = parseADCFile(adcPath)
 		if err == nil {
+			info.Renewable = info.HasRefreshToken
 			info.Source = adcPath
 			return info, nil
 		}
@@ -355,7 +613,12 @@ func parseOAuthFile(path string) (*ExpiryInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseOAuthJSON(data)
+}
 
+// parseOAuthJSON extracts expiry info from the contents of an OAuth token
+// file in the flat layout described by oauthJSON.
+func parseOAuthJSON(data []byte) (*ExpiryInfo, error) {
 	var oauth oauthJSON
 	if err := json.Unmarshal(data, &oauth); err != nil {
 		return nil, fmt.Errorf("parse JSON: %w", err)

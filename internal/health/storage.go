@@ -34,11 +34,55 @@ type ProfileHealth struct {
 	// PenaltyUpdatedAt is when the penalty was last updated.
 	PenaltyUpdatedAt time.Time `json:"penalty_updated_at,omitempty"`
 
-	// PlanType is the subscription tier (free, pro, enterprise).
+	// PlanType is the subscription tier as the provider reports it,
+	// lowercased (free, pro, plus, team, max, ultra, premium, enterprise).
+	// Scorers rank it through PlanTierOf; it is never collapsed to a single
+	// paid spelling, so "max" stays "max" in storage and output.
 	PlanType string `json:"plan_type,omitempty"`
 
 	// LastChecked is when health was last verified.
 	LastChecked time.Time `json:"last_checked,omitempty"`
+
+	// RateLimitedUntil is the end of an active rate-limit cooldown, filled in
+	// at report time from the limit_events table. It is never persisted here:
+	// the DB owns cooldown state. When set and in the future, the cap is the
+	// operative constraint and must be reported as "rate limited" rather than
+	// letting a (possibly stale) TokenExpiresAt masquerade as a token-expiry
+	// problem.
+	RateLimitedUntil time.Time `json:"-"`
+
+	// SelfRefreshing marks TokenExpiresAt as the expiry of an access token
+	// the provider's own CLI renews in place (Claude Code, when a refresh
+	// token is present). Set at report time alongside TokenExpiresAt and
+	// never persisted: the token's TTL is then informational only and must
+	// not lower the verdict, list a reason, or recommend a refresh caam
+	// cannot perform (PR #84).
+	SelfRefreshing bool `json:"-"`
+
+	// TokenRenewable marks TokenExpiresAt as the expiry of an access token
+	// that can be renewed without a human re-authenticating — a refresh token
+	// is stored beside it, or the provider's CLI renews it in place. Set at
+	// report time alongside TokenExpiresAt and never persisted.
+	//
+	// It is the "does this account need a re-login?" half of what
+	// SelfRefreshing used to answer alone. Codex sets it without setting
+	// SelfRefreshing: caam still wants to be told the access token is near
+	// expiry (it has a Codex refresher), but a lapsed-yet-refreshable token
+	// must not be reported as an expired account (issue #102).
+	TokenRenewable bool `json:"-"`
+}
+
+// RateLimited reports whether an active rate-limit cooldown is in effect.
+func (h *ProfileHealth) RateLimited(now time.Time) bool {
+	return h != nil && !h.RateLimitedUntil.IsZero() && h.RateLimitedUntil.After(now)
+}
+
+// CredentialRenewable reports whether the recorded token expiry can be
+// resolved without a human logging in again. It is the predicate the
+// user-facing verdict keys on: a renewable credential's TTL says nothing
+// about whether the account works.
+func (h *ProfileHealth) CredentialRenewable() bool {
+	return h != nil && (h.SelfRefreshing || h.TokenRenewable)
 }
 
 // HealthStore holds health data for all profiles.

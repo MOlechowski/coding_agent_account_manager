@@ -155,18 +155,40 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 		return warnings
 	}
 
+	// A self-refreshing credential (Claude Code with a refresh token) renews
+	// its short-lived access token by itself, and the "caam refresh" this
+	// would recommend is unsupported for it. Warning on every invocation
+	// about a TTL that is routine lifecycle is noise (PR #84).
+	if expInfo.SelfRefreshing {
+		return warnings
+	}
+
 	// Check expiry
 	remaining := time.Until(expInfo.ExpiresAt)
 
 	if remaining <= 0 {
-		// Token expired
-		warnings = append(warnings, Warning{
-			Level:   LevelCritical,
-			Tool:    tool,
-			Profile: profileName,
-			Message: "Token EXPIRED",
-			Action:  fmt.Sprintf("caam login %s %s", tool, profileName),
-		})
+		// Token expired. A credential that carries a refresh token is not a
+		// dead account: caam (or the provider's CLI) renews it, and sending
+		// the operator through a re-login would fix nothing. It still warns —
+		// the refresh daemon runs off this signal — but at warning level and
+		// pointing at the refresh, not the login (issue #102).
+		if expInfo.Renewable {
+			warnings = append(warnings, Warning{
+				Level:   LevelWarning,
+				Tool:    tool,
+				Profile: profileName,
+				Message: "Access token lapsed (renewable)",
+				Action:  fmt.Sprintf("caam refresh %s %s", tool, profileName),
+			})
+		} else {
+			warnings = append(warnings, Warning{
+				Level:   LevelCritical,
+				Tool:    tool,
+				Profile: profileName,
+				Message: "Token EXPIRED",
+				Action:  fmt.Sprintf("caam login %s %s", tool, profileName),
+			})
+		}
 	} else if remaining <= c.CriticalThreshold {
 		// Expires very soon
 		warnings = append(warnings, Warning{

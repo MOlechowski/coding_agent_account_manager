@@ -299,25 +299,99 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		// Migrate legacy vault filename before reading.
 		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expInfo, err = health.ParseGeminiExpiry(vaultPath)
+	case "grok":
+		// Grok's auth.json is keyed by a dynamic "<issuer>::<client-id>" key,
+		// which the Codex parser cannot read; without its own case every Grok
+		// profile scored as unknown-expiry and stuck at warning (issue #101).
+		expInfo, err = health.ParseGrokExpiry(filepath.Join(vaultPath, "auth.json"))
 	}
 
-	// If file parsing succeeds and provides an expiry, treat it as authoritative
-	if err == nil && expInfo != nil && !expInfo.ExpiresAt.IsZero() {
-		ph.TokenExpiresAt = expInfo.ExpiresAt
-	}
-
-	// Fallback: when the vault snapshot yields no usable expiry, derive health
-	// from the profile's own live credential instead of leaving TokenExpiresAt
-	// zero (which caps the verdict at 🟡 Warning forever, even for a perfectly
-	// healthy live token — issue #60). Adopted profiles symlink their auth dir
-	// to the live location, so this reads the real, current token.
-	if ph.TokenExpiresAt.IsZero() {
-		if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && !liveExp.ExpiresAt.IsZero() {
-			ph.TokenExpiresAt = liveExp.ExpiresAt
-		}
+	// Prefer the profile's own live credential over the vault snapshot.
+	// Vault copies are frozen at backup/activate time while tools refresh
+	// the live file in place, so a snapshot expiry can be days stale and
+	// report "Token expired" for a token that is actually valid (PR #82).
+	// Adopted profiles symlink their auth dir to the live location, so this
+	// reads the real, current token; it also keeps TokenExpiresAt from
+	// staying zero, which capped the verdict at 🟡 Warning forever (issue
+	// #60).
+	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && !liveExp.ExpiresAt.IsZero() {
+		applyExpiryInfo(ph, liveExp)
+	} else if err == nil && expInfo != nil && !expInfo.ExpiresAt.IsZero() {
+		// Fallback: the vault snapshot is the best information we have.
+		applyExpiryInfo(ph, expInfo)
 	}
 
 	return ph
+}
+
+// applyExpiryInfo records a parsed credential's expiry on the health
+// snapshot, together with whether that credential is self-refreshing (so the
+// TTL is informational rather than a fault, PR #84) and whether it is
+// renewable at all (so a lapsed-but-refreshable Codex/Grok/Gemini token is
+// not reported as an expired account, issue #102).
+func applyExpiryInfo(ph *health.ProfileHealth, info *health.ExpiryInfo) {
+	ph.TokenExpiresAt = info.ExpiresAt
+	ph.SelfRefreshing = info.SelfRefreshing
+	ph.TokenRenewable = info.Renewable
+}
+
+// liveAuthExpiry parses token expiry from the tool's live (in-use) auth
+// location, e.g. ~/.claude/.credentials.json. Best-effort; returns nil when
+// unavailable.
+func liveAuthExpiry(tool string) *health.ExpiryInfo {
+	var (
+		info *health.ExpiryInfo
+		err  error
+	)
+	switch tool {
+	case "claude":
+		info, err = health.ParseClaudeExpiry("")
+	case "codex":
+		info, err = health.ParseCodexExpiry("")
+	case "gemini":
+		info, err = health.ParseGeminiExpiry("")
+	case "grok":
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			return nil
+		}
+		info, err = health.ParseGrokExpiry(filepath.Join(home, ".grok", "auth.json"))
+	default:
+		return nil
+	}
+	if err != nil {
+		return nil
+	}
+	return info
+}
+
+// applyLiveExpiry replaces a possibly stale vault-snapshot expiry with the
+// expiry of the live credential. Only call this for the ACTIVE profile: the
+// live auth location belongs to whichever profile is currently activated.
+func applyLiveExpiry(tool string, ph *health.ProfileHealth) {
+	if ph == nil {
+		return
+	}
+	if info := liveAuthExpiry(tool); info != nil && !info.ExpiresAt.IsZero() {
+		applyExpiryInfo(ph, info)
+	}
+}
+
+// applyActiveCooldown records an active rate-limit cooldown from limit_events
+// on the health snapshot, so classification reports "rate limited" instead of
+// blaming the token (PR #82). Best-effort: without a DB the field stays zero.
+func applyActiveCooldown(tool, profileName string, ph *health.ProfileHealth) {
+	if ph == nil {
+		return
+	}
+	db, err := getDB()
+	if err != nil || db == nil {
+		return
+	}
+	now := time.Now()
+	if ev, err := db.ActiveCooldown(tool, profileName, now); err == nil && ev != nil && ev.CooldownUntil.After(now) {
+		ph.RateLimitedUntil = ev.CooldownUntil
+	}
 }
 
 // parseLiveProfileExpiry reads the token expiry from a profile's own auth
@@ -340,7 +414,7 @@ func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 	case "gemini":
 		info, err = health.ParseGeminiExpiry(filepath.Join(prof.HomePath(), ".gemini"))
 	case "grok":
-		info, err = health.ParseCodexExpiry(filepath.Join(prof.HomePath(), ".grok", "auth.json"))
+		info, err = health.ParseGrokExpiry(filepath.Join(prof.HomePath(), ".grok", "auth.json"))
 	default:
 		return nil
 	}
@@ -354,6 +428,7 @@ func getProfileHealthWithIdentity(tool, profileName string) (*health.ProfileHeal
 	ph := buildProfileHealth(tool, profileName)
 	id := getVaultIdentity(tool, profileName)
 	applyIdentityToHealth(tool, profileName, ph, id)
+	applyActiveCooldown(tool, profileName, ph)
 	return ph, id
 }
 
@@ -465,16 +540,13 @@ func primePlanTypes(tool string, profiles []string) {
 	}
 }
 
+// normalizePlanType canonicalizes the spelling of a provider-reported plan so
+// storage, display, and scoring agree on one form. It does not collapse
+// tiers: a Claude Max account reports subscriptionType "max" and keeps
+// reading "max" in `caam status`, `caam ls`, and --json output. Scoring
+// ranks plans through health.PlanTierOf rather than by spelling.
 func normalizePlanType(planType string) string {
-	plan := strings.ToLower(strings.TrimSpace(planType))
-	switch plan {
-	case "max", "ultra", "plus", "premium":
-		return "pro"
-	case "enterprise", "team", "pro", "free":
-		return plan
-	default:
-		return plan
-	}
+	return strings.ToLower(strings.TrimSpace(planType))
 }
 
 func formatIdentityDisplay(id *identity.Identity) (string, string) {
@@ -484,8 +556,10 @@ func formatIdentityDisplay(id *identity.Identity) (string, string) {
 		return email, plan
 	}
 
-	// For Claude, email/accountId are no longer available in current auth files.
-	// Show "n/a" instead of "unknown" to indicate this is expected, not an error.
+	// For Claude the email comes from the oauthAccount block of the profile's
+	// .claude.json (the credentials file no longer carries it). A profile
+	// snapshotted without that file has no email to show: "n/a" instead of
+	// "unknown" marks that as expected, not an error.
 	// See: docs/CLAUDE_AUTH_INVENTORY.md (CLAUDE-001, CLAUDE-002)
 	if id.Provider == "claude" && strings.TrimSpace(id.Email) == "" {
 		email = "n/a"
@@ -794,6 +868,9 @@ type statusHealth struct {
 	ExpiresAt         string `json:"expires_at,omitempty"`
 	ErrorCount        int    `json:"error_count"`
 	CooldownRemaining string `json:"cooldown_remaining,omitempty"`
+
+	// The three-signal credential contract (issue #102); see lsHealth.
+	health.Signals
 }
 
 // statusCmd shows which profile is currently active.
@@ -898,8 +975,10 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Get health and identity info
+		// Get health and identity info. The active profile IS the live auth,
+		// so its live expiry supersedes any stale vault snapshot (PR #82).
 		ph, id := getProfileHealthWithIdentity(tool, activeProfile)
+		applyLiveExpiry(tool, ph)
 		status := health.CalculateStatus(ph)
 
 		if jsonOutput {
@@ -911,10 +990,14 @@ func runStatus(cmd *cobra.Command, args []string) error {
 				Health: &statusHealth{
 					Status:     status.String(),
 					ErrorCount: ph.ErrorCount1h,
+					Signals:    health.CredentialSignals(ph, health.DefaultHealthConfig()),
 				},
 			}
 			if !ph.TokenExpiresAt.IsZero() {
 				st.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
+			}
+			if reasons := health.StatusReasons(ph); len(reasons) > 0 {
+				st.Health.Reason = strings.Join(reasons, ", ")
 			}
 			// Get cooldown info
 			cooldownStr := getCooldownString(tool, activeProfile, health.FormatOptions{NoColor: true})
@@ -1007,6 +1090,12 @@ type lsHealth struct {
 	Status     string `json:"status"`
 	ExpiresAt  string `json:"expires_at,omitempty"`
 	ErrorCount int    `json:"error_count"`
+
+	// The three-signal credential contract (issue #102). Status stays the
+	// human-facing composite verdict; controllers should route on
+	// launch_usable and schedulers on refresh_due. A null field means caam
+	// found no evidence either way and is not guessing.
+	health.Signals
 }
 
 // lsCmd lists all stored profiles.
@@ -1109,6 +1198,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 					Health: lsHealth{
 						Status:     status.String(),
 						ErrorCount: ph.ErrorCount1h,
+						Signals:    health.CredentialSignals(ph, health.DefaultHealthConfig()),
 					},
 					Identity: id,
 				}
@@ -1202,6 +1292,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 					Health: lsHealth{
 						Status:     status.String(),
 						ErrorCount: ph.ErrorCount1h,
+						Signals:    health.CredentialSignals(ph, health.DefaultHealthConfig()),
 					},
 					Identity: id,
 				}
@@ -1959,6 +2050,16 @@ Examples:
 		prof, err := profileStore.Load(tool, name)
 		if err != nil {
 			return err
+		}
+
+		// Repair a profile registered without its provider home before handing
+		// off to the tool: otherwise the tool aborts on the missing directory
+		// ("CODEX_HOME points to ..., but that path does not exist") and
+		// `caam profile add` refuses the name, leaving no way forward
+		// (issue #104). This only creates empty directories; existing
+		// credentials are never touched.
+		if err := prof.EnsureLayout(); err != nil {
+			return fmt.Errorf("prepare profile layout: %w", err)
 		}
 
 		ctx := context.Background()

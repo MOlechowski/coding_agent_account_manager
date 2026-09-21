@@ -49,8 +49,8 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We use **Go** with **Make** as the build system in this project.
 
-- **Go version:** 1.24+ (see `go.mod` for minimum)
-- **Toolchain:** `go1.24.4` (pinned in `go.mod`)
+- **Go version:** 1.26+ (see `go.mod` for minimum)
+- **Toolchain:** `go1.26.8` (pinned in `go.mod`)
 - **Build:** `make build` or `go build ./cmd/caam`
 - **Binary name:** `caam`
 - **Dependency versions:** Explicit in `go.mod` for stability
@@ -160,6 +160,18 @@ Tests live alongside implementation in `_test.go` files within each package. Tes
 - Happy path
 - Edge cases (empty input, max values, boundary conditions)
 - Error conditions
+
+### Test Isolation (MANDATORY)
+
+Every package with tests has a `main_test.go` whose `TestMain` calls
+`testutil.IsolatedMain(m)`. It points `HOME` (and the XDG / tool-home
+variables) at a throwaway directory, drops ambient API keys, and puts no-op
+stand-ins for the agent CLIs first on `PATH` before any test runs. Tests
+exercise production code that resolves `os.UserHomeDir()` and launches real
+CLIs; without this guard a plain `go test ./...` on a machine with live
+logins has overwritten `~/.claude.json` and opened OAuth browser tabs.
+`TestEveryTestPackageIsolatesHome` fails the suite when a package lacks the
+guard, so copy an existing `main_test.go` into any new package with tests.
 
 ### Running Tests
 
