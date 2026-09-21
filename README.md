@@ -294,7 +294,7 @@ wait
 **Auth Files:**
 - `~/.gemini/antigravity-cli/antigravity-oauth-token` — token file used by Linux and file-based installations
 - `~/.gemini/google_accounts.json` — active Google account metadata
-- On macOS, current releases store the authoritative token in the Keychain under service `gemini` and account `antigravity`. CAAM copies that secret into the vault during backup and restores it to the Keychain during activation. The token is never passed as a command-line argument.
+- On macOS, current releases store the authoritative token in the Keychain under service `gemini` and account `antigravity`. CAAM copies that secret into the vault during backup and restores it to the Keychain during activation. The token is not written to the Nix store or Git.
 
 **Login Command:** Start `agy` and complete the Google OAuth flow.
 
