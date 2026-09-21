@@ -235,10 +235,10 @@ func autoAddHostKeyCallback(existing ssh.HostKeyCallback, knownHostsPath string)
 			}
 		}
 
-		// Unknown host - auto-add (TOFU)
+		// Unknown host - auto-add (TOFU). If persistence fails, reject the
+		// connection rather than silently losing the host-key guarantee.
 		if err := addToKnownHosts(knownHostsPath, hostname, key); err != nil {
-			// Log but don't fail - the connection can still proceed
-			fmt.Fprintf(os.Stderr, "Warning: could not add %s to known hosts: %v\n", hostname, err)
+			return fmt.Errorf("could not persist host key for %s: %w", hostname, err)
 		}
 
 		return nil

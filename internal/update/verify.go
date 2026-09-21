@@ -84,11 +84,10 @@ func verifyMinisignBytes(publicKey string, message, signature []byte) error {
 // newer releases are signed with minisign and verified by VerifyMinisign.
 // It requires cosign to be installed on the system.
 func VerifySignature(ctx context.Context, checksumsPath, signaturePath, tag, owner, repo string) error {
-	// Check if cosign is available
+	// Signature verification is mandatory for legacy releases. Without cosign,
+	// the checksum file is unauthenticated and must not be trusted.
 	if _, err := exec.LookPath("cosign"); err != nil {
-		// If cosign is not installed, skip signature verification with a warning
-		// This allows updates to work even without cosign, but logs the skip
-		return nil // Consider logging: "cosign not found, skipping signature verification"
+		return fmt.Errorf("cosign is required to verify legacy release signatures: %w", err)
 	}
 
 	// Build the expected identity for the OIDC certificate

@@ -182,8 +182,9 @@ func GeminiAuthFiles() AuthFileSet {
 // cache lives at ~/.gemini/oauth_creds.json. The antigravity-cli settings.json
 // carries the default model.
 //
-// Keyring note: agy does NOT use the OS keyring (libsecret) on Linux — the token
-// file is the authoritative credential, so caam backs up files only.
+// On Linux, agy uses the token file directly. Current macOS releases use the
+// Keychain instead; caam snapshots that item into the same vault filename and
+// restores it on activation.
 //
 // Every basename here is unique, so files from the two directories
 // (~/.gemini and ~/.gemini/antigravity-cli) never collide in the vault.
@@ -443,6 +444,24 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 	optionalFound := false
 	var missingRequired []string
 	var originalPaths []string
+
+	// Current macOS Antigravity releases keep the required OAuth token in the
+	// Keychain instead of writing antigravity-oauth-token to disk. Snapshot that
+	// token under the same vault filename so restore remains provider-neutral.
+	if fileSet.Tool == "agy" {
+		if token, ok, err := agyKeychainToken(); err != nil {
+			return fmt.Errorf("read agy keychain credential: %w", err)
+		} else if ok {
+			destPath := filepath.Join(profileDir, "antigravity-oauth-token")
+			if err := writePrivateFileAtomic(destPath, token); err != nil {
+				return fmt.Errorf("backup agy keychain credential: %w", err)
+			}
+			backedUp++
+			requiredFound = true
+			originalPaths = append(originalPaths, agyKeychainDescription)
+		}
+	}
+
 	for _, spec := range fileSet.Files {
 		// Claude Desktop config: capture ONLY the oauth:tokenCache* fields, so we
 		// never persist (or later clobber) unrelated desktop settings (PR #44).
@@ -465,7 +484,7 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 		}
 
 		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
-			if spec.Required {
+			if spec.Required && !(fileSet.Tool == "agy" && filepath.Base(spec.Path) == "antigravity-oauth-token" && requiredFound) {
 				missingRequired = append(missingRequired, spec.Path)
 			}
 			continue // Skip optional files that don't exist
@@ -819,6 +838,17 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 		filename := filepath.Base(spec.Path)
 		srcPath := filepath.Join(profileDir, filename)
 
+		if fileSet.Tool == "agy" && agyKeychainSupported() && filename == "antigravity-oauth-token" {
+			if token, err := os.ReadFile(srcPath); err == nil {
+				if err := setAgyKeychainToken(token); err != nil {
+					return fmt.Errorf("restore agy keychain credential: %w", err)
+				}
+				restored++
+				requiredFound = true
+				continue
+			}
+		}
+
 		// Check if backup exists
 		if _, err := os.Stat(srcPath); os.IsNotExist(err) {
 			if spec.Required {
@@ -1097,6 +1127,12 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 	currentHashes := make(map[string]string)
 	optionalHashes := make(map[string]string)
 	requiredFound := false
+	if fileSet.Tool == "agy" {
+		if token, ok, err := agyKeychainToken(); err == nil && ok {
+			currentHashes["antigravity-oauth-token"] = hashBytes(token)
+			requiredFound = true
+		}
+	}
 	for _, spec := range fileSet.Files {
 		// A Claude Desktop config with no token cache carries no identity; skip it
 		// so unrelated desktop settings never drive profile detection (PR #44).
@@ -1182,6 +1218,12 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 
 // HasAuthFiles checks if the tool currently has auth files present.
 func HasAuthFiles(fileSet AuthFileSet) bool {
+	if fileSet.Tool == "agy" {
+		if _, ok, err := agyKeychainToken(); err == nil && ok {
+			return true
+		}
+	}
+
 	// Best-effort mirror: a macOS Claude login lives in the keychain, and
 	// reporting "not logged in" for it would send callers down the login path
 	// (issue #98).
@@ -1212,6 +1254,12 @@ func HasAuthFiles(fileSet AuthFileSet) bool {
 
 // ClearAuthFiles removes all auth files for a tool (logout).
 func ClearAuthFiles(fileSet AuthFileSet) error {
+	if fileSet.Tool == "agy" {
+		if err := clearAgyKeychainToken(); err != nil {
+			return fmt.Errorf("clear agy keychain credential: %w", err)
+		}
+	}
+
 	for _, spec := range fileSet.Files {
 		// For the Claude Desktop config, scrub only the oauth:tokenCache* keys so
 		// logout does not destroy the user's unrelated desktop settings (PR #44).
@@ -1460,6 +1508,35 @@ func writeJSONFileAtomic(path string, v interface{}, perm os.FileMode) error {
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func writePrivateFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := f.Chmod(0600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
 		return err
 	}
 	if err := f.Close(); err != nil {

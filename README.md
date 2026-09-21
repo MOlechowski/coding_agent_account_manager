@@ -315,7 +315,7 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 |------|--------------|---------------|
 | **Claude Code** | OAuth: `~/.claude/.credentials.json` + `~/.claude.json` + `~/.config/claude-code/auth.json` + (macOS) `~/Library/Application Support/Claude/config.json` • API key: `~/.claude/settings.json` | `/login` in CLI |
 | **Codex CLI** | `~/.codex/auth.json` (file store enforced) | `codex login` (or `--device-auth`) |
-| **Antigravity CLI** | OAuth: `~/.gemini/antigravity-cli/antigravity-oauth-token` (+ `~/.gemini/google_accounts.json`) | `agy` interactive (Google OAuth) |
+| **Antigravity CLI** | OAuth: `~/.gemini/antigravity-cli/antigravity-oauth-token` (+ `~/.gemini/google_accounts.json`); current macOS releases use Keychain service `gemini`, account `antigravity` | `agy` interactive (Google OAuth) |
 | **Gemini CLI** (legacy) | OAuth: `~/.gemini/settings.json` (+ `oauth_creds.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
 | **Grok Build** (xAI) | OAuth/OIDC: `~/.grok/auth.json` (+ `~/.grok/config.toml`); respects `GROK_HOME` | `grok login` (browser OIDC) |
 
@@ -353,6 +353,17 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 **Notes:** Respects `CODEX_HOME`. CAAM enforces file-based auth storage by writing `cli_auth_credentials_store = "file"` to `~/.codex/config.toml` inside the profile.
 
 > **Running a `codex app-server` daemon?** Codex can run as a long-lived daemon (`codex app-server`, also `codex mcp-server`) that caches `auth.json` in memory at startup. Swapping the auth file on disk does **not** change the account that daemon serves until it is restarted. After `caam activate/switch/next codex`, CAAM detects a running daemon and prints a warning. Pass `--reload-daemon` to have CAAM `SIGTERM` the daemon (it respawns with the new auth on next use) — it never kills a daemon silently.
+
+### Antigravity CLI
+
+**Auth Files:**
+- `~/.gemini/antigravity-cli/antigravity-oauth-token` — token file used by Linux and file-based installations
+- `~/.gemini/google_accounts.json` — active Google account metadata
+- On macOS, current releases store the authoritative token in the Keychain under service `gemini` and account `antigravity`. CAAM copies that secret into the vault during backup and restores it to the Keychain during activation. The token is not written to the Nix store or Git.
+
+**Login Command:** Start `agy` and complete the Google OAuth flow.
+
+**Notes:** Set `GEMINI_HOME` when using an isolated file-based installation. CAAM uses the Keychain only for the default macOS `~/.gemini` location; custom `GEMINI_HOME` values continue to use files.
 
 ### Gemini CLI (Google One AI Premium)
 
