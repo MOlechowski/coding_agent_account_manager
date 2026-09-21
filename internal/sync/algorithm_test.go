@@ -217,67 +217,51 @@ func TestAggregateResults(t *testing.T) {
 	}
 }
 
-// TestListLocalProfiles tests listing local profiles.
+// TestListLocalProfiles tests listing every provider the sync walker supports.
 func TestListLocalProfiles(t *testing.T) {
 	tmpDir := t.TempDir()
-
-	// Create vault structure
-	claudePath := filepath.Join(tmpDir, "claude")
-	codexPath := filepath.Join(tmpDir, "codex")
-
-	if err := os.MkdirAll(filepath.Join(claudePath, "alice@gmail.com"), 0700); err != nil {
-		t.Fatalf("Failed to create test dir: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Join(claudePath, "bob@gmail.com"), 0700); err != nil {
-		t.Fatalf("Failed to create test dir: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Join(codexPath, "work@company.com"), 0700); err != nil {
-		t.Fatalf("Failed to create test dir: %v", err)
+	expected := map[ProfileRef]bool{
+		{Provider: "claude", Profile: "main"}:   false,
+		{Provider: "codex", Profile: "main"}:    false,
+		{Provider: "gemini", Profile: "main"}:   false,
+		{Provider: "agy", Profile: "main"}:      false,
+		{Provider: "grok", Profile: "main"}:     false,
+		{Provider: "opencode", Profile: "main"}: false,
+		{Provider: "cursor", Profile: "main"}:   false,
 	}
 
-	// Create a file (should be ignored)
-	if err := os.WriteFile(filepath.Join(claudePath, "not_a_profile.txt"), []byte("test"), 0600); err != nil {
-		t.Fatalf("Failed to create test file: %v", err)
+	for profile := range expected {
+		profilePath := filepath.Join(tmpDir, profile.Provider, profile.Profile)
+		if err := os.MkdirAll(profilePath, 0700); err != nil {
+			t.Fatalf("create %s/%s profile: %v", profile.Provider, profile.Profile, err)
+		}
 	}
 
-	syncer := &Syncer{
-		vaultPath: tmpDir,
+	ignoredFile := filepath.Join(tmpDir, "claude", "not_a_profile.txt")
+	if err := os.WriteFile(ignoredFile, []byte("test"), 0600); err != nil {
+		t.Fatalf("create ignored file: %v", err)
 	}
 
+	syncer := &Syncer{vaultPath: tmpDir}
 	profiles, err := syncer.listLocalProfiles()
 	if err != nil {
-		t.Fatalf("listLocalProfiles failed: %v", err)
+		t.Fatalf("list local profiles: %v", err)
+	}
+	if len(profiles) != len(expected) {
+		t.Fatalf("list local profiles returned %d profiles, want %d: %v", len(profiles), len(expected), profiles)
 	}
 
-	if len(profiles) != 3 {
-		t.Errorf("len(profiles) = %d, want 3", len(profiles))
-	}
-
-	// Verify profiles
-	hasAlice := false
-	hasBob := false
-	hasWork := false
-
-	for _, p := range profiles {
-		if p.Provider == "claude" && p.Profile == "alice@gmail.com" {
-			hasAlice = true
+	for _, profile := range profiles {
+		if _, ok := expected[profile]; !ok {
+			t.Errorf("unexpected profile: %+v", profile)
+			continue
 		}
-		if p.Provider == "claude" && p.Profile == "bob@gmail.com" {
-			hasBob = true
+		expected[profile] = true
+	}
+	for profile, found := range expected {
+		if !found {
+			t.Errorf("missing profile: %+v", profile)
 		}
-		if p.Provider == "codex" && p.Profile == "work@company.com" {
-			hasWork = true
-		}
-	}
-
-	if !hasAlice {
-		t.Error("Missing alice@gmail.com profile")
-	}
-	if !hasBob {
-		t.Error("Missing bob@gmail.com profile")
-	}
-	if !hasWork {
-		t.Error("Missing work@company.com profile")
 	}
 }
 
