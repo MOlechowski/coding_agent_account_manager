@@ -973,9 +973,7 @@ func (s *Syncer) getRemoteFreshness(client *SSHClient, p ProfileRef) (*TokenFres
 func (s *Syncer) listLocalProfiles() ([]ProfileRef, error) {
 	var profiles []ProfileRef
 
-	providers := []string{"claude", "codex", "gemini", "opencode", "cursor"}
-
-	for _, provider := range providers {
+	for _, provider := range SyncedProviders() {
 		providerPath := filepath.Join(s.vaultPath, provider)
 
 		entries, err := os.ReadDir(providerPath)
@@ -1003,9 +1001,7 @@ func (s *Syncer) listLocalProfiles() ([]ProfileRef, error) {
 func (s *Syncer) listRemoteProfiles(client *SSHClient) ([]ProfileRef, error) {
 	var profiles []ProfileRef
 
-	providers := []string{"claude", "codex", "gemini", "opencode", "cursor"}
-
-	for _, provider := range providers {
+	for _, provider := range SyncedProviders() {
 		// Use posixJoin for remote paths since SFTP always uses forward slashes
 		providerPath := posixJoin(s.remoteVaultPath, provider)
 
